@@ -26,21 +26,22 @@ use clash_verge_service_ipc::{
     RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceErrorCode, ServiceStatusSnapshot,
     StageRuntimeOutcome, StartClashRequest, WriterConfig,
 };
+use futures::FutureExt as _;
 use parking_lot::Mutex;
-#[cfg(target_os = "macos")]
-use std::sync::LazyLock;
 use std::{
     collections::HashMap,
     env::current_exe,
     future::Future,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command as StdCommand,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::{sync::watch, time::Instant};
 
 static OWNER_MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SERVICE_SESSION: Mutex<Option<ActiveServiceSession>> = Mutex::new(None);
@@ -838,61 +839,81 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-static PROVIDER_SYNC_QUEUED: AtomicBool = AtomicBool::new(false);
-// Serializing the whole read-and-publish pass prevents an older cache from replacing a newer one.
-static PROVIDER_SYNC_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PROVIDER_SYNC_REQUESTS: LazyLock<watch::Sender<Option<Instant>>> = LazyLock::new(|| {
+    let (sender, receiver) = watch::channel(None);
+    let requests = sender.clone();
+    AsyncHandler::spawn(move || run_provider_sync(requests, receiver));
+    sender
+});
 static SYNC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RUNTIME_PROVIDER_SYNC_ATTEMPTS: u32 = 4;
 const CONTENT_COMPARE_CHUNK: usize = 64 * 1024;
 
 pub(crate) fn request_runtime_provider_sync(delay: Duration) {
-    if PROVIDER_SYNC_QUEUED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    AsyncHandler::spawn(move || async move {
-        tokio::time::sleep(delay).await;
-        use crate::utils::retry::{RetryError, RetryPolicy, retry};
-        let _ = retry(
-            RetryPolicy::fixed(
-                std::num::NonZeroUsize::MIN.saturating_add((RUNTIME_PROVIDER_SYNC_ATTEMPTS - 1) as usize),
-                constants::timing::RUNTIME_PROVIDER_SYNC_RETRY_DELAY,
-            ),
-            |index| async move {
-                let attempt = index as u32 + 1;
-                let outcome = {
-                    let _serial = PROVIDER_SYNC_SERIAL.lock().await;
-                    if attempt == 1 {
-                        PROVIDER_SYNC_QUEUED.store(false, Ordering::Release);
-                    }
-                    sync_runtime_providers_by_service().await
-                };
-                match outcome {
-                    Ok(ProviderSync { pending: 0, .. }) => Ok(()),
-                    Ok(ProviderSync { pending, .. }) if attempt < RUNTIME_PROVIDER_SYNC_ATTEMPTS => {
-                        logging!(
-                            info,
-                            Type::Service,
-                            "{pending} provider caches are not ready yet; retrying"
-                        );
-                        Err(RetryError::Retry(()))
-                    }
-                    Ok(ProviderSync { pending, .. }) => {
-                        logging!(warn, Type::Service, "{pending} provider caches were not synced");
-                        Ok(())
-                    }
-                    Err(error) => {
-                        logging!(
-                            warn,
-                            Type::Service,
-                            "failed to sync provider caches from the service: {error:#}"
-                        );
-                        Ok(())
-                    }
-                }
-            },
-        )
-        .await;
+    let due = Instant::now() + delay;
+    PROVIDER_SYNC_REQUESTS.send_if_modified(|pending| {
+        if pending.is_some_and(|current| current <= due) {
+            return false;
+        }
+        *pending = Some(due);
+        true
     });
+}
+
+async fn run_provider_sync(requests: watch::Sender<Option<Instant>>, mut pending: watch::Receiver<Option<Instant>>) {
+    let mut retry: Option<(Instant, u32)> = None;
+    loop {
+        let requested = *pending.borrow_and_update();
+        let next = requested.into_iter().chain(retry.map(|(due, _)| due)).min();
+        let Some(due) = next else {
+            let _ = pending.changed().await;
+            continue;
+        };
+        let now = Instant::now();
+        if due > now {
+            tokio::select! {
+                _ = pending.changed() => {}
+                _ = tokio::time::sleep_until(due) => {}
+            }
+            continue;
+        }
+
+        requests.send_if_modified(|requested| requested.take_if(|due| *due <= now).is_some());
+        let attempt = retry.take_if(|(due, _)| *due <= now).map_or(1, |(_, attempt)| attempt);
+
+        // Serialize the whole read-and-publish pass so an older cache cannot replace a newer one.
+        match AssertUnwindSafe(sync_runtime_providers_by_service())
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(ProviderSync { pending: 0, .. })) => retry = None,
+            Ok(Ok(ProviderSync { pending, .. })) if attempt < RUNTIME_PROVIDER_SYNC_ATTEMPTS => {
+                logging!(
+                    info,
+                    Type::Service,
+                    "{pending} provider caches are not ready yet; retrying"
+                );
+                // A new request during backoff leaves the existing retry deadline and budget intact.
+                retry.get_or_insert_with(|| {
+                    (
+                        Instant::now() + constants::timing::RUNTIME_PROVIDER_SYNC_RETRY_DELAY,
+                        attempt + 1,
+                    )
+                });
+            }
+            Ok(Ok(ProviderSync { pending, .. })) => {
+                logging!(warn, Type::Service, "{pending} provider caches were not synced");
+            }
+            Ok(Err(error)) => {
+                logging!(
+                    warn,
+                    Type::Service,
+                    "failed to sync provider caches from the service: {error:#}"
+                );
+            }
+            Err(_) => logging!(error, Type::Service, "provider cache sync panicked"),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
